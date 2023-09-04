@@ -1,0 +1,195 @@
+package com.bosch.ticket.parser.alm;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpResponse;
+import org.apache.http.ParseException;
+import org.apache.http.util.EntityUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.json.JsonParseException;
+import org.springframework.stereotype.Component;
+
+import com.bosch.ticket.model.alm.ALMPRTeamAreaUser;
+import com.bosch.ticket.model.alm.ALMPullRequestUser;
+import com.bosch.ticket.model.alm.ALMTicket;
+import com.bosch.ticket.constants.ALMConstants;
+import com.fasterxml.jackson.core.JacksonException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import lombok.extern.slf4j.Slf4j;
+
+@Component
+@Slf4j
+public class ALMResponseParser {
+
+	@Autowired
+	ObjectMapper objectMapper = new ObjectMapper();
+	@Autowired
+	private ALMPullRequestUser almUser;
+	@Autowired
+	private ALMPRTeamAreaUser almTeamAreaUser;
+
+	private String key = "key";
+	private String value = "value";
+	private String id = "id";
+
+	/*
+	 * This method is to read the links for the given display name(like parent,
+	 * contributes to..) from response
+	 */
+	public List<String> getLinks(JsonNode linkAttrNode) {
+		List<String> links = new ArrayList<>();
+		linkAttrNode.get("linkDTOs").forEach(linkAttr -> linkAttr.get("target").get("attributes").forEach(link -> {
+			if (link.get(key).asText().equalsIgnoreCase(id))
+				links.add(link.get(value).get(id).asText());
+		}));
+		return links;
+	}
+
+	/*
+	 * @param : responseString - Response of getItem API This method is to read the
+	 * Soap xml body and return as object..
+	 */
+	public ALMTicket processGetItemResponse(String responseString) {
+
+		var almTicket = new ALMTicket();        
+		objectMapper = new ObjectMapper();
+		Map<String, List<String>> links = new HashMap<>();
+		try {
+
+			JsonNode jsonResponseNode = objectMapper.readTree(responseString);
+			JsonNode valueNode = jsonResponseNode.get("soapenv:Body").get("response").get("returnValue").get(value);
+			/*
+			 * In case of entering a Invalid ticket id, ValueNode will be null.
+			 *
+			 */
+			if (valueNode != null && !valueNode.isEmpty()) {
+				almTicket = new ALMTicket();
+				JsonNode attrNode = valueNode.get("attributes");
+				JsonNode linkTypeNode = valueNode.get("linkTypes");
+				
+				if(linkTypeNode!=null && !linkTypeNode.isEmpty())
+						linkTypeNode.forEach(linkAttrNode -> {
+					if (linkAttrNode.get("displayName").asText().equalsIgnoreCase("Parent"))
+						links.put("Parent", getLinks(linkAttrNode));
+					if (linkAttrNode.get("displayName").asText().equalsIgnoreCase("Children"))
+						links.put("Children", getLinks(linkAttrNode));
+				});
+				if (!links.isEmpty())
+					almTicket.setLinks(links);
+
+				for (JsonNode item : attrNode) {
+					if (item.get(key).asText().equalsIgnoreCase(id))
+						almTicket.setTicketId(item.get(value).get(id).asText());
+
+					if (item.get(key).asText().equalsIgnoreCase("owner"))
+						almTicket.setOwner(item.get(value).get("userId").asText());
+
+					if (item.get(key).asText().equalsIgnoreCase("workItemType"))
+						almTicket.setType(item.get(value).get("label").asText());
+
+					if (item.get(key).asText().equalsIgnoreCase("projectArea"))
+						almTicket.setProjectArea(item.get(value).get(id).asText());
+
+					if (item.get(key).asText().equalsIgnoreCase("teamArea"))
+						almTicket.setTeamArea(item.get(value).get(id).asText());
+
+					if (item.get(key).asText().equalsIgnoreCase("summary"))
+						almTicket.setTitle(item.get(value).get("content").asText());
+
+					if (item.get(key).asText().equalsIgnoreCase("internalState"))
+						almTicket.setState(item.get(value).get("label").asText());
+
+					if (item.get(key).asText().equalsIgnoreCase(ALMConstants.DETAIL_STATUS))
+						almTicket.setDetailedStatus(item.get(value).get("label").asText());
+				}
+			}
+
+		} catch (NullPointerException | JacksonException | JsonParseException e) {
+			log.info("Error occurred while processing get item response:" + e.getMessage());
+		}
+		return almTicket;
+		}
+	
+	/*
+	 * This method for getting the details of PR raised user by setting true or false as status based on
+	 * their availability in project area. 
+	 * 
+	 * @param - this method expects HttpResponse with members details and Pull Request raised user id
+	 * and @return ALMPullRequestUser with success
+	 */
+	public ALMPullRequestUser memberResponseProcess(HttpResponse httpResponse, String prRaisedUser) {
+		 
+		List<String> rtcMembersList = new ArrayList<>();
+		try {
+			HttpEntity entity = httpResponse.getEntity();
+			String MembersResponse = EntityUtils.toString(entity);
+			JsonNode jsonResponseNode;
+			jsonResponseNode = objectMapper.readTree(MembersResponse);
+			
+			almUser.setProjectAreaId(jsonResponseNode.get("rdf:resource").asText());
+			almUser.setProjectAreaName(jsonResponseNode.get("dc:title").asText());
+			JsonNode rtcMembers = jsonResponseNode.get("rtc_cm:members");
+             log.info("rtc Members: "+rtcMembers);
+			if (rtcMembers != null && !rtcMembers.isEmpty() && rtcMembers.isArray()) {
+				for (JsonNode element : rtcMembers) {
+					String[] value = element.get("rdf:resource").asText().split("/");
+					rtcMembersList.add(value[value.length - 1].toUpperCase());
+				}
+				almUser.setProjectMember(false);
+				for (String member : rtcMembersList) {
+					if (member.equalsIgnoreCase(prRaisedUser.toUpperCase())) {
+						almUser.setProjectMember(true);
+						break;
+					}
+				}
+			}
+		} catch (ParseException | IOException e) {
+			log.info("Error occurred while processing members response:" + e.getMessage());
+		}
+		return almUser;
+	}
+	/*
+	 * This method for getting the details of PR raised user by setting true or false as status based on
+	 * their availability in team area. 
+	 * 
+	 * @param - this method expects HttpResponse with members details and Pull Request raised user id
+	 * and @return ALMPullRequestUser with success
+	 */
+	public ALMPRTeamAreaUser memberResponseProcessForTeamArea(HttpResponse httpResponse, String prRaisedUser) {
+		 
+		List<String> rtcMembersList = new ArrayList<>();
+		try {
+			HttpEntity entity = httpResponse.getEntity();
+			String MembersResponse = EntityUtils.toString(entity);
+			JsonNode jsonResponseNode;
+			jsonResponseNode = objectMapper.readTree(MembersResponse);
+			almTeamAreaUser.setTeamAreaId(jsonResponseNode.get("rdf:resource").asText());
+			almTeamAreaUser.setTeamAreaName(jsonResponseNode.get("dc:title").asText());
+			JsonNode rtcMembers = jsonResponseNode.get("rtc_cm:members");
+             log.info("rtc Members: "+rtcMembers);
+			if (rtcMembers != null && !rtcMembers.isEmpty() && rtcMembers.isArray()) {
+				for (JsonNode element : rtcMembers) {
+					String[] value = element.get("rdf:resource").asText().split("/");
+					rtcMembersList.add(value[value.length - 1].toUpperCase());
+				}
+				almTeamAreaUser.setTeamMember(false);
+				for (String member : rtcMembersList) {
+					if (member.equalsIgnoreCase(prRaisedUser.toUpperCase())) {
+						almTeamAreaUser.setTeamMember(true);
+						break;
+					}
+				}
+			}
+		} catch (ParseException | IOException e) {
+			log.info("Error occurred while processing team area members response:" + e.getMessage());
+		}
+		return almTeamAreaUser;
+	}
+}

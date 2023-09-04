@@ -1,0 +1,86 @@
+
+package com.bosch.ticket.controller;
+
+import com.bosch.ticket.model.GitInformation;
+import com.bosch.ticket.service.ALMService;
+import com.bosch.ticket.service.RQOneService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping(path = "/ticket")
+@Slf4j
+public class TicketController {
+
+    @Autowired
+    private RQOneService rqoneservice;
+    @Autowired
+    private ALMService almService;
+    @Autowired
+    ObjectMapper objectMapper;
+
+    @GetMapping(value = "/message", produces = "application/json")
+    public ResponseEntity<?> message() {
+        return ResponseEntity.ok().body("{\"message\":\"Welcome to Ticket Handler Service\"}");
+    }
+
+    @GetMapping(value = "/GetItem/{tickteID}", produces = "application/json")
+    public ResponseEntity<?> status(@PathVariable("tickteID") String ticketid) {
+    	 ticketid = ticketid.toUpperCase(); 
+    	String errorMessage;
+    	
+        if (!StringUtils.isBlank(ticketid) && ticketid.startsWith("RQONE"))
+             return rqoneservice.getTicketStatusByRq1Id(ticketid); 
+        else
+    		errorMessage = "{\"message\":\"Ticket does not belong to RQONE system\"}";
+         if(!StringUtils.isBlank(ticketid) && ticketid.startsWith("RTCWI-"))
+        	return almService.getALMDetailsById(ticketid, true);
+        else
+        	errorMessage = "{\"message\":\"Ticket does not belong to ALM system\"}";
+         
+         if(!ticketid.startsWith("RTCWI-") && !ticketid.startsWith("RQONE"))
+             errorMessage = "{\"message\":\"Ticket does not belong to either ALM or RQONE system\"}";
+            return ResponseEntity.ok().body(errorMessage);
+    }
+
+    @GetMapping(value = "/IsProjectMember/{tickteID}/{prRaisedUser}", produces = "application/json")
+    public ResponseEntity<?> getTicketOwner(@PathVariable("tickteID") String ticketid,
+    		@PathVariable("prRaisedUser") String prRaisedUser) {
+    	ticketid = ticketid.toUpperCase(); 
+    	String errorMessage;
+    	if (!StringUtils.isBlank(ticketid) && ticketid.startsWith("RQONE"))
+           return rqoneservice.getProjectMemeberByRq1Id(ticketid , prRaisedUser);
+    	else
+    		errorMessage = "{\"message\":\"Ticket does not belong to RQONE system\"}";
+         if(!StringUtils.isBlank(ticketid) && ticketid.startsWith("RTCWI-"))
+            return almService.getProjectMemeberByAlmId(ticketid, prRaisedUser);
+         else
+        	 errorMessage = "{\"message\":\"Ticket does not belong to ALM system\"}";
+         if(!ticketid.startsWith("RTCWI-") && !ticketid.startsWith("RQONE"))
+             errorMessage = "{\"message\":\"Ticket does not belong to either ALM or RQONE system\"}";
+        
+          return ResponseEntity.ok().body(errorMessage);
+    }
+
+	@PostMapping(value = "/MapItem")
+	public ResponseEntity<?> writeTags(@RequestBody JsonNode body) {			
+		GitInformation gitInfo = new GitInformation();
+		if (body!=null && body.has("ItemID") && body.get("ItemID").asText()!=null 
+				&& body.get("ItemID").asText().contains("RQONE")) {
+			gitInfo.setItemID(body.get("ItemID").asText());
+			gitInfo.setPullRequestUrl(body.get("PullRequestUrl").asText());
+			gitInfo.setPullRequestUrlTitle(body.get("PullRequestUrlTitle").asText());
+			return rqoneservice.writeGitPRLinkToRq1Id(gitInfo);
+		}
+		//
+		else if (body!=null && body.get("pull_request").get("body").asText().contains("RTCWI "))
+			return almService.writeMapItemsToALM(body);
+		else
+			return ResponseEntity.ok().body("{\"message\":\"Ticket does not belong to either RQONE or ALM\"}");
+	}
+}

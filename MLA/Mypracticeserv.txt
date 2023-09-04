@@ -1,0 +1,292 @@
+package com.bosch.ticket.service;
+
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.http.Header;
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpResponse;
+import org.apache.http.NameValuePair;
+import org.apache.http.ParseException;
+import org.apache.http.auth.InvalidCredentialsException;
+import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.message.BasicNameValuePair;
+import org.apache.http.util.EntityUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+
+import com.bosch.ticket.config.ALMConfg;
+import com.bosch.ticket.model.alm.ALMPRTeamAreaUser;
+import com.bosch.ticket.model.alm.ALMPullRequestUser;
+import com.bosch.ticket.model.alm.ALMTicket;
+import com.bosch.ticket.parser.alm.ALMResponseParser;
+import com.bosch.ticket.constants.ALMConstants;
+import com.bosch.ticket.utils.PasswordUtils;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+@Service
+public class ALMService {
+
+	private static final Logger log = LoggerFactory.getLogger(ALMService.class);
+
+	@Autowired
+	ALMConfg almConfig;
+	@Autowired
+	ObjectMapper objectMapper;
+	CloseableHttpClient httpClient;
+	@Autowired
+	ALMResponseParser almReponseParser;
+	private ALMPullRequestUser almUser;
+	private ALMPRTeamAreaUser almTeamAreaUser;
+	/*
+	 * This method is to find the given PR raised user is part of project area and 
+	 * team area.so first it will check whether the user is available in project area. If user not
+	 * present in project area, it will check in team area and return the respective object as JSON.
+	 * 
+	 * @param ALMticketid and @param PR raised user are input params and @return
+	 * ResponseEntity with JSON object
+	 */
+
+	public ResponseEntity<?> getProjectMemeberByAlmId(String ticketid, String prRaisedUser) {
+
+		ResponseEntity<?> response = getALMDetailsById(ticketid,false);
+		HttpResponse httpResponse = null;
+		if (response.getBody().getClass().equals(ALMTicket.class)) {
+			ALMTicket aLMTicket = (ALMTicket) response.getBody();
+			String projectAreaName = aLMTicket.getProjectArea();
+			String teamAreaName = aLMTicket.getTeamArea();
+			if (projectAreaName != null && !projectAreaName.isEmpty()) {
+				if(teamAreaName !=null && !teamAreaName.isEmpty()) {
+				try {
+
+					if (almLogin()) {
+						httpResponse = getmembers(ALMConstants.ALM_PROJECT_AREA, projectAreaName);
+						int statusCode = httpResponse.getStatusLine().getStatusCode();
+					if (statusCode == 200) {
+						Header header = httpResponse.getFirstHeader(ALMConstants.FORM_AUTH_HEADER);
+						if ((header != null) && (header.getValue().equals(ALMConstants.FORM_AUTH_REQUIRED_MSG)))
+							return ResponseEntity.ok()
+									.body(ALMConstants.ERROR_MSG + " " + ALMConstants.AUTH_FAILED_MSG);
+							/*
+							 *Here we are checking for project area details by calling memberResponseProcess method 
+							 *if user is present in the response, project area details will be set to almUser,
+							 *if not available team area details will be checked by calling memberResponseProcessForTeamArea and
+							 *response will be set to almTeamAreaUser and return the same. 
+							 */
+							else {
+								almUser = almReponseParser.memberResponseProcess(httpResponse, prRaisedUser);
+								if (almUser.isProjectMember() == false) {
+									httpResponse = getmembers(ALMConstants.ALM_TEAM_AREA, teamAreaName);
+									log.info("ALM User Model details: "+almUser.toString());
+									almTeamAreaUser = almReponseParser.memberResponseProcessForTeamArea(httpResponse, prRaisedUser);
+								return ResponseEntity.ok().body(almTeamAreaUser);
+								}
+								else
+									return ResponseEntity.ok().body(almUser);
+							}
+						}
+						else if (statusCode == 404 || statusCode == 400)
+							return ResponseEntity.ok().body(
+									"Unable to process your request with" + " " + ticketid + ". " + ALMConstants.INVALID_ITEM_MSG);
+					}
+				} catch (NullPointerException | InvalidCredentialsException | UnsupportedOperationException
+						| ParseException | IOException e) {
+					log.error("isProjectMember API error: "+e.getMessage());
+				} finally {
+					try {
+						httpClient.close();
+					} catch (IOException | NullPointerException e) {
+						log.error("Error occurred while closing the connection:" + e.getMessage());
+					}
+				}
+				}else 
+					
+					return ResponseEntity.ok().body("the teamAreaName is not available:");
+
+			} else
+				return ResponseEntity.ok().body("the projectAreaName is not available:");
+		} 
+			return ResponseEntity.ok().body(response.getBody());
+	}
+
+	/*
+	 * This method is to make a API(Get the details of the given work item id) to
+	 * ALM server.
+	 * @Param almTicketId is input Param,
+	 * @param isAuthCloseable -- This variable to decide whether the ALM connection has to be closed after API or not.
+	 * @return ResponseEntity with JSON object
+	 */
+	public ResponseEntity<?> getALMDetailsById(String almTicketId, boolean isAuthCloseable) {
+		String ticketid = "";
+		if (almTicketId.contains("-")) {
+			String[] id = almTicketId.split("-");
+			ticketid = id[id.length - 1];
+		}
+		try {
+			if (ticketid != null && !ticketid.isEmpty() && almLogin()) {
+				HttpGet get = new HttpGet();
+		        URI uri = new URI(almConfig.getAlmURL() + ALMConstants.WORK_ITEM_LINK +ticketid);
+				get.setURI(uri);
+				get.addHeader(ALMConstants.HEADER_TYPE_ACCEPT, ALMConstants.HEADER_VALUE_TEXT_JSON);
+				get.addHeader(ALMConstants.HEADER_TYPE_CONTENT, ALMConstants.HEADER_VALUE_APPL_FORM);
+				CloseableHttpResponse httpResponse = httpClient.execute(get);
+				int statusCode = httpResponse.getStatusLine().getStatusCode();
+				if (statusCode == 200) {
+					Header header = httpResponse.getFirstHeader(ALMConstants.FORM_AUTH_HEADER);
+					if ((header != null) && (header.getValue().equals(ALMConstants.FORM_AUTH_REQUIRED_MSG)))
+						return ResponseEntity.ok().body(ALMConstants.ERROR_MSG + " " + ALMConstants.AUTH_FAILED_MSG);
+					else {
+						HttpEntity entity = httpResponse.getEntity();
+						String responseString = EntityUtils.toString(entity);
+						log.info("ALM Get Item response:" + responseString);
+						/*
+						 * In case of entering a Invalid ticket id, status code coming as 200 and will
+						 * return null during response process. So Interpreting error message as invalid
+						 * item in else block below.
+						 */
+						ALMTicket getItemsResponse = almReponseParser.processGetItemResponse(responseString);
+						if (getItemsResponse != null && !getItemsResponse.toString().isEmpty())
+							return ResponseEntity.ok().body(getItemsResponse);
+						else
+							return ResponseEntity.ok().body(
+									"Unable to find item" + " " + ticketid + ". " + ALMConstants.INVALID_ITEM_MSG);
+					}
+				} else if (statusCode == 404 || statusCode == 400)
+					return ResponseEntity.ok()
+							.body("Unable to find item" + " " + ticketid + ". " + ALMConstants.INVALID_ITEM_MSG);
+			} 
+		} catch (NullPointerException  | InvalidCredentialsException | UnsupportedOperationException | ParseException
+				| IOException | URISyntaxException e) {
+			log.error(ALMConstants.ERROR_MSG + "due to:" + " ", e.getMessage());
+		}finally {
+			try {
+				if(isAuthCloseable == true)
+				  httpClient.close();
+			} catch (IOException | NullPointerException e) {
+				log.error("Error occurred while closing the connection:" + e.getMessage());
+			}
+		}
+		return ResponseEntity.ok().body(ALMConstants.ERROR_MSG);
+	}
+
+	/*
+	 * This method is to map the github pull request url into the ALM system under
+	 * the given work item id and repository with repo key
+	 * 
+	 * @param - JsonNode will be the input to the method with JSON payload including
+	 * user details and repository details and @return ResponseEntity with success
+	 * or failure status with a message based on the response from ALM
+	 */
+	public ResponseEntity<?> writeMapItemsToALM(JsonNode body) {
+		try {
+			if (almLogin()) {
+				HttpPost post = new HttpPost();
+				URI uri = new URI(almConfig.getAlmURL() + ALMConstants.MAP_ITEM_URL_WITH_REPO_KEY);
+				post.setURI(uri);
+				post.addHeader(ALMConstants.HEADER_TYPE_CONTENT, ALMConstants.HEADER_VALUE_APPL_JSON);
+				post.addHeader(ALMConstants.HEADER_TYPE_XGITHUB, ALMConstants.HEADER_TYPE_PULL_REQUEST);
+				if (body != null && !body.toString().isEmpty()) {
+					String jsonPayload = body.toString();
+					StringEntity stringPayload = new StringEntity(jsonPayload);
+					post.setEntity(stringPayload);
+					HttpResponse httpResponse = httpClient.execute(post);
+					log.info("httpResponse for mapitem to add into ALM: " + httpResponse.toString());
+					int responseStatusCode = httpResponse.getStatusLine().getStatusCode();
+					if (responseStatusCode == 200) {
+						HttpEntity entity = httpResponse.getEntity();
+						String responseString = EntityUtils.toString(entity);
+						log.info("response for mapitem add into ALM: " + responseString);
+						return ResponseEntity.ok("map item details posted successfully...");
+					} else
+						return ResponseEntity.ok()
+								.body("updating map item details failed because of status code: " + responseStatusCode);
+				}
+			}
+		} catch (Exception e) {
+			log.error(ALMConstants.ERROR_MSG + "due to:" + " ", e.getMessage());
+		} finally {
+			try {
+				httpClient.close();
+			} catch (IOException | NullPointerException e) {
+				log.error("Error occurred while closing the connection:" + e.getMessage());
+			}
+		}
+		return ResponseEntity.ok()
+				.body("updating map item details failed");
+	}
+
+	public boolean almLogin() throws IOException, InvalidCredentialsException {
+		boolean isAuth = false;
+		httpClient = HttpClientBuilder.create().build();
+		 HttpPost login = new HttpPost(almConfig.getAlmURL() + ALMConstants.JTS_SERVER);
+		List<NameValuePair> params = new ArrayList<>();
+		params.add(new BasicNameValuePair("j_username", almConfig.getAlmUsername()));
+		params.add(new BasicNameValuePair("j_password", PasswordUtils.decodePassword(almConfig.getAlmPassword())));
+		login.setEntity(new UrlEncodedFormEntity(params));
+
+		HttpResponse formResponse = httpClient.execute(login);
+		log.info("ALM login response:" + formResponse.toString());
+
+		EntityUtils.consume(formResponse.getEntity());
+		int formSc = formResponse.getStatusLine().getStatusCode();
+		if ((formSc == 200) || (formSc == 302)) {
+			Header header = formResponse.getFirstHeader(ALMConstants.FORM_AUTH_HEADER);
+			String redirectURI = formResponse.getFirstHeader("Location").getValue();
+			if ((header != null) && (header.getValue().equals(ALMConstants.FORM_AUTH_FAILED_MSG))) {
+				// The login failed
+				throw new InvalidCredentialsException("Authentication failed");
+			} else if ((formSc == 302) && redirectURI.contains(ALMConstants.FORM_AUTH_FAILED_URI)) {
+				throw new InvalidCredentialsException("Authentication failed");
+			} else {
+				HttpPost post = new HttpPost(redirectURI);
+				formResponse = httpClient.execute(post);
+				// Step (3): Request again the protected resource
+				EntityUtils.consume(formResponse.getEntity());
+				isAuth = true;
+
+			}
+		}
+		return isAuth;
+	}
+
+	/*
+	 * This method for getting the members response from ALM after successful login
+	 * 
+	 * @param - this method expects String type projectareas and String project area id as input parameters 
+	 * to check whether the user is part of Project area and if not again it will expects teamareas as String type
+	 * team area id as String id
+	 * and @return HttpResponse with success
+	 */
+	public HttpResponse getmembers(String type, String id) {
+
+		URI uri;
+		HttpResponse httpResponse = null;
+		try {
+			HttpGet httpGet = new HttpGet();
+			uri = new URI(almConfig.getAlmURL() + "/ccm/oslc/" + type + "/" + id);
+			httpGet.setURI(uri);
+			httpGet.addHeader(ALMConstants.HEADER_TYPE_ACCEPT, ALMConstants.HEADER_VALUE_APPL_JSON);
+			httpResponse = httpClient.execute(httpGet);
+			log.info("httpResponse getMembers method: "+httpResponse.getEntity().toString());
+		} catch (IOException | URISyntaxException e) {
+			
+			log.error("Parse error while parsing HttpResponse getMembers method: "+e.getMessage());
+		}
+		return httpResponse;
+	}
+
+}
